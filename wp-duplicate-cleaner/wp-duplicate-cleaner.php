@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Duplicate Post Cleaner with Redirect Logging
  * Description: Automatically identifies and trashes duplicate posts based on title and content, and logs 301 redirects for deleted posts.
- * Version: 2.9
+ * Version: 3.1
  * Author: Reza Consulting Inc.
  */
 
@@ -52,7 +52,43 @@ class DuplicatePostCleaner {
         $entry = "[$time] " . $message . "\n";
         file_put_contents($this->debug_log_path, $entry, FILE_APPEND | LOCK_EX);
     }
+	
+	// Helper function to safely read only the last N lines of large log files
+    private function get_last_lines($filepath, $lines = 150) {
+        if (!file_exists($filepath) || !is_readable($filepath) || filesize($filepath) === 0) {
+            return '';
+        }
 
+        $handle = @fopen($filepath, 'r');
+        if (!$handle) {
+            return 'Unable to open log file.';
+        }
+
+        $buffer_size = 4096;
+        $output = '';
+        $line_count = 0;
+
+        fseek($handle, 0, SEEK_END);
+        $pos = ftell($handle);
+
+        while ($pos > 0 && $line_count <= $lines) {
+            $seek_size = min($pos, $buffer_size);
+            $pos -= $seek_size;
+            fseek($handle, $pos);
+            $chunk = fread($handle, $seek_size);
+            $output = $chunk . $output;
+            $line_count = substr_count($output, "\n");
+        }
+
+        fclose($handle);
+
+        $file_lines = explode("\n", $output);
+        if (count($file_lines) > $lines) {
+            $file_lines = array_slice($file_lines, -$lines);
+        }
+
+        return implode("\n", $file_lines);
+    }
     // Schedule cron job
     public function schedule_cron() {
         $settings = get_option($this->option_name, array());
@@ -94,6 +130,86 @@ class DuplicatePostCleaner {
     private function release_lock() {
         delete_transient($this->lock_key);
     }
+
+    private function redirects_table() {
+        global $wpdb;
+        return $wpdb->prefix . 'dpc_redirects';
+    }
+
+    // $overwrite = true for cleaner results, false for imports (existing rows win)
+    private function save_redirects($pairs, $source, $overwrite) {
+        global $wpdb;
+        $table = $this->redirects_table();
+        $saved = 0;
+        foreach (array_chunk($pairs, 1000) as $chunk) {
+            $values = array();
+            foreach ($chunk as $pair) {
+                if ($pair[0] > 0 && $pair[1] > 0 && $pair[0] !== $pair[1]) {
+                    $values[] = $wpdb->prepare('(%d, %d, %s)', $pair[0], $pair[1], $source);
+                }
+            }
+            if (empty($values)) {
+                continue;
+            }
+            $sql = ($overwrite ? 'INSERT' : 'INSERT IGNORE')
+                . " INTO {$table} (old_id, new_id, source) VALUES " . implode(',', $values)
+                . ($overwrite ? ' ON DUPLICATE KEY UPDATE new_id = VALUES(new_id), source = VALUES(source)' : '');
+            $saved += (int) $wpdb->query($sql);
+        }
+        return $saved;
+    }
+
+    // Point every redirect at the end of its chain (A->B, B->C becomes A->C)
+    private function flatten_redirects() {
+        global $wpdb;
+        $table = $this->redirects_table();
+        for ($pass = 0; $pass < 20; $pass++) {
+            $changed = $wpdb->query("UPDATE {$table} r1 INNER JOIN {$table} r2 ON r1.new_id = r2.old_id
+                SET r1.new_id = r2.new_id WHERE r2.new_id <> r1.old_id");
+            if (!$changed) {
+                break;
+            }
+        }
+        $wpdb->query("DELETE FROM {$table} WHERE old_id = new_id");
+    }
+
+    // Reads RewriteCond/RewriteRule boost_post_id pairs from a file (htaccess or redirect log)
+    public function import_redirects_from_file($path) {
+        if (!is_readable($path)) {
+            return false;
+        }
+        $handle = fopen($path, 'r');
+        if (!$handle) {
+            return false;
+        }
+        @set_time_limit(0);
+        $pending = 0;
+        $pairs   = array();
+        $found   = 0;
+        $added   = 0;
+
+        while (($line = fgets($handle)) !== false) {
+            if (preg_match('/^\s*RewriteCond\s.*boost_post_id=(\d+)/', $line, $m)) {
+                $pending = (int) $m[1];
+                continue;
+            }
+            if ($pending && preg_match('/^\s*RewriteRule\s.*boost_post_id=(\d+)/', $line, $m)) {
+                $pairs[] = array($pending, (int) $m[1]);
+                $found++;
+                if (count($pairs) >= 1000) {
+                    $added += $this->save_redirects($pairs, 'import', false);
+                    $pairs = array();
+                }
+            }
+            $pending = 0;
+        }
+        fclose($handle);
+        $added += $this->save_redirects($pairs, 'import', false);
+        $this->flatten_redirects();
+
+        return array('found' => $found, 'added' => $added);
+    }
+
 
     // Main function to clean duplicates
     public function clean_duplicates() {
@@ -158,6 +274,7 @@ class DuplicatePostCleaner {
         $post_ids = array();
 
         // Priority 1: Get posts that have NEVER been checked (state = 0 or no meta)
+		/*
         $sql = $wpdb->prepare("
             SELECT p.ID 
             FROM {$wpdb->posts} p
@@ -168,7 +285,21 @@ class DuplicatePostCleaner {
             ORDER BY p.ID DESC
             LIMIT %d
         ", $this->meta_key, self::STATE_UNCHECKED, $limit);
-        
+        */
+		
+		$sql = $wpdb->prepare("
+            SELECT p.ID
+            FROM {$wpdb->postmeta} f
+            INNER JOIN {$wpdb->posts} p ON p.ID = f.post_id
+            WHERE f.meta_key = 'dw_needs_dupcheck'
+            AND p.post_type = 'post'
+            AND p.post_status = 'publish'
+            GROUP BY p.ID
+            ORDER BY p.ID DESC
+            LIMIT %d
+        ", $limit);
+		
+		
         $post_ids = $wpdb->get_col($sql);
         $this->log_debug("Found " . count($post_ids) . " un-checked posts.");
         
@@ -183,6 +314,7 @@ class DuplicatePostCleaner {
                 AND p.post_status = 'publish'
                 AND pm.meta_value = %d
                 AND pm.meta_value < %d
+				GROUP BY p.ID
                 ORDER BY p.ID DESC
                 LIMIT %d
             ", $this->meta_key, self::STATE_UNIQUE, time() - (3600 * 24 * 30), $remaining);
@@ -195,7 +327,9 @@ class DuplicatePostCleaner {
         // Priority 3: As a last resort, get "keeper" posts that are very old for a final sanity check (e.g., 1 year)
         // This is optional but can catch edge cases. For now, we'll skip it to avoid complexity.
         
-        return $post_ids;
+        //return $post_ids;
+		return array_values(array_unique(array_map('intval', $post_ids)));
+
     }
 
     // Identify duplicates efficiently
@@ -296,6 +430,25 @@ class DuplicatePostCleaner {
             if (!empty($redirect_lines)) {
                 file_put_contents($this->log_file_path, implode('', $redirect_lines), FILE_APPEND | LOCK_EX);
             }
+
+            // Raw SQL bypasses WordPress, so clear the (Redis) object cache for trashed posts
+            foreach (array_map('intval', $all_delete_ids) as $trashed_id) {
+                clean_post_cache($trashed_id);
+            }
+
+            $pairs = array();
+            foreach ($duplicate_groups as $data) {
+                foreach ($data['delete_ids'] as $delete_id) {
+                    $pairs[] = array((int) $delete_id, (int) $data['keep_id']);
+                }
+            }
+            $this->save_redirects($pairs, 'cleaner', true);
+
+            // Re-point older redirects whose target was just trashed
+            $table = $this->redirects_table();
+            $wpdb->query("UPDATE {$table} r1 INNER JOIN {$table} r2 ON r1.new_id = r2.old_id
+                SET r1.new_id = r2.new_id
+                WHERE r2.old_id IN ($delete_ids_str) AND r2.new_id <> r1.old_id");
         }
         
         // UPDATED: State management logic
@@ -305,6 +458,15 @@ class DuplicatePostCleaner {
         $this->log_debug("Marking " . count($posts_to_set_as_keeper) . " posts as 'Keeper'.");
         $this->log_debug("Marking " . count($posts_to_set_as_unique) . " posts as 'Unique'.");
         
+		$mark_ids = array_unique(array_merge($posts_to_set_as_keeper, $posts_to_set_as_unique));
+        $mark_ids_str = implode(',', array_map('intval', $mark_ids));
+        if ($mark_ids_str !== '') {
+            $wpdb->query($wpdb->prepare(
+                "DELETE FROM {$wpdb->postmeta} WHERE meta_key = %s AND post_id IN ($mark_ids_str)",
+                $this->meta_key
+            ));
+        }
+		
         $time = time();
         $chunks = array_chunk($posts_to_set_as_keeper, 100);
         foreach ($chunks as $chunk) {
@@ -329,6 +491,11 @@ class DuplicatePostCleaner {
                 $wpdb->query($query);
             }
         }
+		
+        $batch_ids_str = implode(',', array_map('intval', $all_post_ids_in_batch));
+        if ($batch_ids_str !== '') {
+            $wpdb->query("DELETE FROM {$wpdb->postmeta} WHERE meta_key = 'dw_needs_dupcheck' AND post_id IN ($batch_ids_str)");
+        }
         
         $this->log_debug("Batch processing completed in " . round(microtime(true) - $start_time, 2) . " seconds");
         return $results;
@@ -342,10 +509,17 @@ class DuplicatePostCleaner {
         wp_send_json_success(array('message' => 'Cleanup completed', 'debug_log' => file_exists($this->debug_log_path) ? file_get_contents($this->debug_log_path) : ''));
     }
 
-    // Clear all checked history
+	// Clear all checked history
     public function clear_checked_history() {
         global $wpdb;
         $wpdb->query("DELETE FROM {$wpdb->postmeta} WHERE meta_key = '" . esc_sql($this->meta_key) . "'");
+		
+		$wpdb->query("DELETE FROM {$wpdb->postmeta} WHERE meta_key = 'dw_needs_dupcheck'");
+        $wpdb->query("INSERT INTO {$wpdb->postmeta} (post_id, meta_key, meta_value)
+            SELECT ID, 'dw_needs_dupcheck', '1' FROM {$wpdb->posts}
+            WHERE post_type = 'post' AND post_status = 'publish'");
+        
+		delete_transient('dpc_status_counts'); // Clear cached count transient
         return true;
     }
 
@@ -390,17 +564,35 @@ class DuplicatePostCleaner {
         <?php
     }
 
-    public function settings_page() {
+	public function settings_page() {
         $clear_history_nonce = wp_create_nonce('dpc_clear_history');
-        $clear_debug_nonce = wp_create_nonce('dpc_clear_debug');
-        $manual_run_nonce = wp_create_nonce('dpc_manual_run');
-        
+        $clear_debug_nonce   = wp_create_nonce('dpc_clear_debug');
+        $manual_run_nonce    = wp_create_nonce('dpc_manual_run');
+
         global $wpdb;
-        // Updated counts to reflect the new state system
-        $unchecked_count = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = %d", $this->meta_key, self::STATE_UNCHECKED));
-        $unique_count = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = %d", $this->meta_key, self::STATE_UNIQUE));
-        $keeper_count = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = %d", $this->meta_key, self::STATE_KEEPER));
-        $total_posts = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'post' AND post_status = 'publish'");
+
+        // Cache count queries in a 5-minute transient to prevent full database table scans on every page load
+        $counts = get_transient('dpc_status_counts');
+        if (!is_array($counts)) {
+            $total_posts     = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'post' AND post_status = 'publish'");
+            $unique_count    = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = %d", $this->meta_key, self::STATE_UNIQUE));
+            $keeper_count    = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = %d", $this->meta_key, self::STATE_KEEPER));
+            $unchecked_count = max(0, $total_posts - ($unique_count + $keeper_count));
+
+            $counts = array(
+                'total_posts'     => $total_posts,
+                'unique_count'    => $unique_count,
+                'keeper_count'    => $keeper_count,
+                'unchecked_count' => $unchecked_count,
+            );
+            set_transient('dpc_status_counts', $counts, 300);
+        }
+
+        $total_posts     = isset($counts['total_posts']) ? (int) $counts['total_posts'] : 0;
+        $unique_count    = isset($counts['unique_count']) ? (int) $counts['unique_count'] : 0;
+        $keeper_count    = isset($counts['keeper_count']) ? (int) $counts['keeper_count'] : 0;
+        $unchecked_count = isset($counts['unchecked_count']) ? (int) $counts['unchecked_count'] : 0;
+
         $processed_percentage = $total_posts > 0 ? round((($unique_count + $keeper_count) / $total_posts) * 100, 2) : 0;
         ?>
         <div class="wrap">
@@ -408,25 +600,25 @@ class DuplicatePostCleaner {
             <form action='options.php' method='post'>
                 <?php settings_fields($this->option_name); do_settings_sections($this->option_name); submit_button(); ?>
             </form>
-            
+
             <h2>Progress</h2>
             <p>Total published posts: <strong><?php echo esc_html($total_posts); ?></strong></p>
             <p>Unchecked posts (Priority 1): <strong><?php echo esc_html($unchecked_count); ?></strong></p>
             <p>Unique posts (Priority 2): <strong><?php echo esc_html($unique_count); ?></strong></p>
             <p>Keeper posts (Finalized): <strong><?php echo esc_html($keeper_count); ?></strong></p>
             <p>Posts processed: <strong><?php echo esc_html($processed_percentage); ?>%</strong></p>
-            
-            <form method="post" action="">
+
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
                 <?php wp_nonce_field('dpc_clear_history'); ?>
-                <input type="hidden" name="dpc_action" value="clear_history">
+                <input type="hidden" name="action" value="dpc_clear_history">
                 <button type="submit" class="button button-secondary">Reset All Post States</button>
                 <p class="description">This will clear all states, forcing a full re-check of all posts.</p>
             </form>
-            
+
             <h2>Actions</h2>
             <button id="dpc-manual-run" class="button button-primary">Run Cleanup Now</button>
             <div id="dpc-result" style="margin-top: 10px;"></div>
-            
+
             <script>
             jQuery(document).ready(function($) {
                 $('#dpc-manual-run').click(function() {
@@ -439,20 +631,43 @@ class DuplicatePostCleaner {
             });
             </script>
             <hr>
-            <h2>Debug Log</h2>
-            <form method="post" action=""><?php wp_nonce_field('dpc_clear_debug'); ?><input type="hidden" name="dpc_action" value="clear_debug"><button type="submit" class="button button-secondary">Clear Debug Log</button></form>
-            <textarea rows="20" cols="80" readonly style="font-family: monospace; font-size: 12px; width: 100%;"><?php if (file_exists($this->debug_log_path)) { echo esc_textarea(file_get_contents($this->debug_log_path)); } else { echo "Debug log file not found."; } ?></textarea>
+            <h2>Debug Log (Last 150 lines)</h2>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                <?php wp_nonce_field('dpc_clear_debug'); ?>
+                <input type="hidden" name="action" value="dpc_clear_debug">
+                <button type="submit" class="button button-secondary">Clear Debug Log</button>
+            </form>
+            <textarea rows="20" cols="80" readonly style="font-family: monospace; font-size: 12px; width: 100%; margin-top: 10px;"><?php 
+                echo esc_textarea($this->get_last_lines($this->debug_log_path, 150)); 
+            ?></textarea>
             <hr>
-            <h2>Redirect Log</h2>
+            <h2>Redirect Table</h2>
+            <?php if (isset($_GET['dpc_import_found'])) : ?>
+                <div class="notice notice-success"><p>Import finished: <?php echo (int) $_GET['dpc_import_found']; ?> rules found, <?php echo (int) $_GET['dpc_import_added']; ?> new redirects added.</p></div>
+            <?php elseif (isset($_GET['dpc_import_error'])) : ?>
+                <div class="notice notice-error"><p>Import file not found or not readable.</p></div>
+            <?php endif; ?>
+            <p>Redirects stored: <strong><?php echo esc_html(number_format_i18n((int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}dpc_redirects"))); ?></strong></p>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                <?php wp_nonce_field('dpc_import_redirects'); ?>
+                <input type="hidden" name="action" value="dpc_import_redirects">
+                <label>File to import (<code>.htaccess</code>, or a file name in wp-content/uploads/):
+                    <input type="text" name="dpc_import_file" value="dpc_redirect_log.txt" class="regular-text"></label>
+                <button type="submit" class="button button-secondary">Import Redirects</button>
+            </form>
+            <hr>
+            <h2>Redirect Log (Last 150 lines)</h2>
             <p>Redirects are logged to: <code><?php echo esc_html($this->log_file_path); ?></code></p>
-            <?php if (file_exists($this->log_file_path)) { echo '<textarea rows="10" cols="80" readonly style="font-family: monospace; font-size: 12px; width: 100%;">' . esc_textarea(file_get_contents($this->log_file_path)) . '</textarea>'; } else { echo '<p>No redirects logged yet.</p>'; } ?>
+            <textarea rows="10" cols="80" readonly style="font-family: monospace; font-size: 12px; width: 100%;"><?php 
+                echo esc_textarea($this->get_last_lines($this->log_file_path, 150)); 
+            ?></textarea>
         </div>
         <?php
     }
     
-    // Handle Clear History button
+// Handle Clear History button
     public function handle_clear_history() {
-        if (!isset($_POST['dpc_action']) || $_POST['dpc_action'] !== 'clear_history') { return; }
+        if (!isset($_POST['action']) || $_POST['action'] !== 'dpc_clear_history') { return; }
         if (!isset($_POST['_wpnonce']) || !wp_verify_nonce($_POST['_wpnonce'], 'dpc_clear_history')) { wp_die('Security check failed'); }
         $result = $this->clear_checked_history();
         if ($result) { add_action('admin_notices', function() { echo '<div class="notice notice-success is-dismissible"><p>States cleared successfully.</p></div>'; }); }
@@ -460,10 +675,39 @@ class DuplicatePostCleaner {
     
     // Handle Clear Debug Log button
     public function handle_clear_debug() {
-        if (!isset($_POST['dpc_action']) || $_POST['dpc_action'] !== 'clear_debug') { return; }
+        if (!isset($_POST['action']) || $_POST['action'] !== 'dpc_clear_debug') { return; }
         if (!isset($_POST['_wpnonce']) || !wp_verify_nonce($_POST['_wpnonce'], 'dpc_clear_debug')) { wp_die('Security check failed'); }
         $result = $this->clear_debug_log();
         if ($result) { add_action('admin_notices', function() { echo '<div class="notice notice-success is-dismissible"><p>Debug log cleared.</p></div>'; }); }
+    }
+
+    // Handle Import Redirects button
+    public function handle_import_redirects() {
+        if (!current_user_can('manage_options')) { wp_die('Not allowed'); }
+        check_admin_referer('dpc_import_redirects');
+
+        $back = admin_url('options-general.php?page=duplicate_post_cleaner');
+        $name = isset($_POST['dpc_import_file']) ? trim(wp_unslash($_POST['dpc_import_file'])) : '';
+        if ($name === '.htaccess') {
+            if (!function_exists('get_home_path')) {
+                require_once ABSPATH . 'wp-admin/includes/file.php';
+            }
+            $path = get_home_path() . '.htaccess';
+        } else {
+            $name = sanitize_file_name($name);
+            $path = WP_CONTENT_DIR . '/uploads/' . $name;
+        }
+
+        $result = $name !== '' ? $this->import_redirects_from_file($path) : false;
+        if ($result === false) {
+            wp_safe_redirect(add_query_arg('dpc_import_error', 1, $back));
+            exit;
+        }
+        wp_safe_redirect(add_query_arg(array(
+            'dpc_import_found' => $result['found'],
+            'dpc_import_added' => $result['added'],
+        ), $back));
+        exit;
     }
 }
 
@@ -473,3 +717,77 @@ $duplicate_post_cleaner = new DuplicatePostCleaner();
 // Hook into admin_post to handle buttons
 add_action('admin_post_dpc_clear_history', array($duplicate_post_cleaner, 'handle_clear_history'));
 add_action('admin_post_dpc_clear_debug', array($duplicate_post_cleaner, 'handle_clear_debug'));
+
+add_action( 'transition_post_status', function ( $new_status, $old_status, $post ) {
+	if ( 'publish' === $new_status && 'post' === $post->post_type
+		&& ! metadata_exists( 'post', $post->ID, '_dpc_checked' ) ) {
+		update_post_meta( $post->ID, 'dw_needs_dupcheck', '1' );
+	}
+}, 10, 3 );
+
+// Creates/updates the redirect table. dbDelta() requires this exact formatting.
+// For future schema changes: edit the CREATE TABLE text and bump both '1' values to '2'.
+function dpc_install_redirects_table() {
+    global $wpdb;
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+    $table           = $wpdb->prefix . 'dpc_redirects';
+    $charset_collate = $wpdb->get_charset_collate();
+
+    $sql = "CREATE TABLE {$table} (
+  old_id bigint(20) unsigned NOT NULL,
+  new_id bigint(20) unsigned NOT NULL,
+  source varchar(20) NOT NULL DEFAULT 'cleaner',
+  created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY  (old_id),
+  KEY new_id (new_id)
+) {$charset_collate};";
+
+    dbDelta($sql);
+    update_option('dpc_db_version', '1', false);
+}
+register_activation_hook(__FILE__, 'dpc_install_redirects_table');
+
+// Activation hooks don't run when a file is replaced on an active plugin
+add_action('plugins_loaded', function () {
+    if (get_option('dpc_db_version') !== '1') {
+        dpc_install_redirects_table();
+    }
+});
+
+add_action('admin_post_dpc_import_redirects', array($duplicate_post_cleaner, 'handle_import_redirects'));
+
+// 301 trashed duplicates on /boost/?boost_post_id=X to their kept post
+add_action('init', function () {
+    if (empty($_GET['boost_post_id'])) {
+        return;
+    }
+    $path = trim((string) parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/');
+    if ($path !== 'boost') {
+        return;
+    }
+    $requested = absint($_GET['boost_post_id']);
+    if (!$requested || 'publish' === get_post_status($requested)) {
+        return;
+    }
+
+    global $wpdb;
+    $target = $requested;
+    for ($hop = 0; $hop < 10; $hop++) {
+        $next = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT new_id FROM {$wpdb->prefix}dpc_redirects WHERE old_id = %d", $target
+        ));
+        if (!$next || $next === $target) {
+            break;
+        }
+        $target = $next;
+        if ('publish' === get_post_status($target)) {
+            break;
+        }
+    }
+
+    if ($target !== $requested && 'publish' === get_post_status($target)) {
+        wp_safe_redirect(add_query_arg('boost_post_id', $target, home_url('/boost/')), 301);
+        exit;
+    }
+}, 0);
