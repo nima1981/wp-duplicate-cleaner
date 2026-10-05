@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Duplicate Post Cleaner with Redirect Logging
  * Description: Automatically identifies and trashes duplicate posts based on title and content, and logs 301 redirects for deleted posts.
- * Version: 3.1
+ * Version: 2.9
  * Author: Reza Consulting Inc.
  */
 
@@ -306,7 +306,23 @@ class DuplicatePostCleaner {
         // Priority 2: If we need more, get "unique" posts that haven't been re-checked in a long time (e.g., 30 days)
         if (count($post_ids) < $limit) {
             $remaining = $limit - count($post_ids);
-            $sql = $wpdb->prepare("
+			
+			$sql = $wpdb->prepare("
+                SELECT p.ID
+                FROM {$wpdb->posts} p FORCE INDEX (PRIMARY)
+                WHERE p.post_type = 'post'
+                AND p.post_status = 'publish'
+                AND EXISTS (
+                    SELECT 1 FROM {$wpdb->postmeta} pm
+                    WHERE pm.post_id = p.ID
+                    AND pm.meta_key = %s
+                    AND pm.meta_value = %s
+                )
+                ORDER BY p.ID DESC
+                LIMIT %d
+            ", $this->meta_key, (string) self::STATE_UNIQUE, $remaining);
+			
+/*            $sql = $wpdb->prepare("
                 SELECT p.ID 
                 FROM {$wpdb->posts} p
                 INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = %s
@@ -318,7 +334,7 @@ class DuplicatePostCleaner {
                 ORDER BY p.ID DESC
                 LIMIT %d
             ", $this->meta_key, self::STATE_UNIQUE, time() - (3600 * 24 * 30), $remaining);
-            
+*/            
             $old_unique_posts = $wpdb->get_col($sql);
             $post_ids = array_merge($post_ids, $old_unique_posts);
             $this->log_debug("Added " . count($old_unique_posts) . " old 'unique' posts for re-check.");
